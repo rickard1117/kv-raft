@@ -70,24 +70,22 @@ type Raft struct {
 	// state a Raft server must maintain.
 
 	// 2A
-	currentTerm int // latest term server has seen
-	votedFor    int // candidateId that received vote in current term (or -1 if none)
-	votes       int // number of votes received
-	state       raftState
-	timer       *time.Timer
-	voteCh      chan RequestVoteArgs
-	appendCh    chan AppendEntriesArgs
+	currentTerm     int // latest term server has seen
+	votedFor        int // candidateId that received vote in current term (or -1 if none)
+	votes           int // number of votes received
+	state           raftState
+	lastHBrecvTime  time.Time
+	lastHBsendTime  time.Time
+	timeBeCandidate time.Time
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
 	// Your code here (2A).
-
-	return term, isleader
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.currentTerm, rf.state == leader
 }
 
 //
@@ -152,38 +150,68 @@ type RequestVoteReply struct {
 
 // election timeouts in the range of 450 to 900 milliseconds
 func electionTimeout() time.Duration {
-	return time.Duration(rand.Intn(450) + 450)
+	return time.Duration(rand.Intn(450)+450) * time.Millisecond
+}
+
+func sendHBInterval() time.Duration {
+	return time.Duration(200 * time.Millisecond)
 }
 
 // becomeFollower must be called after rf.mu.Lock()
 func (rf *Raft) becomeFollower(term int) {
+	log.Printf("[%d] %v -> follower\n", rf.me, rf.state)
 	rf.state = follower
 	rf.currentTerm = term
 	rf.votedFor = -1
 	rf.votes = 0
-	rf.timer.Reset(electionTimeout())
 }
 
 // becomeLeader must be called after rf.mu.Lock()
 func (rf *Raft) becomeLeader() {
+	log.Printf("[%d] candidate -> leader\n", rf.me)
 	rf.state = leader
 	rf.votedFor = -1
 	rf.votes = 0
-	rf.timer.Reset(heartbeatTimeout())
+	func() {
+		for i := 0; i < len(rf.peers); i++ {
+			if i == rf.me {
+				continue
+			}
+			go rf.processAppendEntries(i, rf.currentTerm)
+		}
+	}()
+}
+
+// should lock first
+func (rf *Raft) startElection() {
+	rf.currentTerm++
+	rf.votedFor = -1
+	rf.votes = 0
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			rf.votedFor = i
+			rf.votes++
+			continue
+		}
+		go rf.processRequestVote(i, rf.currentTerm)
+	}
 }
 
 func (rf *Raft) becomeCandidate() {
 	log.Printf("[%d] follower -> candidate\n", rf.me)
-	rf.currentTerm++
 	rf.state = candidate
-	rf.votedFor = -1
-	rf.votes = 0
-	rf.timer.Reset(electionTimeout())
+	rf.startElection()
 }
 
 func (rf *Raft) processVoteReply(req RequestVoteArgs, reply RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
+	if rf.state != candidate {
+		// 收到其他peers发送的reply之前，已经发生了状态转换，那么就不处理
+		log.Printf("[%d] current state : %v is not candidate, no processing vote reply\n", rf.me, rf.state)
+		return
+	}
 
 	if reply.Term > rf.currentTerm {
 		if reply.VoteGranted {
@@ -195,7 +223,7 @@ func (rf *Raft) processVoteReply(req RequestVoteArgs, reply RequestVoteReply) {
 	}
 
 	if reply.Term < rf.currentTerm && rf.currentTerm > req.Term {
-		log.Printf("[%d] old RPC reply, do nothing\n")
+		log.Printf("[%d] old RPC reply, do nothing\n", rf.me)
 		return
 	}
 
@@ -206,7 +234,7 @@ func (rf *Raft) processVoteReply(req RequestVoteArgs, reply RequestVoteReply) {
 
 	log.Printf("[%d] granted\n", rf.me)
 	rf.votes++
-	if rf.votes >= len(rf.peers)/2 {
+	if rf.votes >= len(rf.peers)/2+1 {
 		log.Printf("[%d] candidate -> leader", rf.me)
 		rf.becomeLeader()
 	}
@@ -226,27 +254,9 @@ func (rf *Raft) processRequestVote(server int, term int) {
 	rf.processVoteReply(req, reply)
 }
 
-func (rf *Raft) processTimeout() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	if rf.state == follower {
-		rf.becomeCandidate()
-
-		for i := 0; i < len(rf.peers); i++ {
-			if i == rf.me {
-				rf.votedFor = i
-				rf.votes++
-				continue
-			}
-			go rf.processRequestVote(i, rf.currentTerm)
-		}
-	} else if rf.state == candidate {
-		rf.becomeCandidate()
-	} else {
-		// leader
-		rf.becomeFollower(rf.currentTerm)
-	}
+// should lock first
+func (rf *Raft) keepBedingFollower() {
+	rf.lastHBrecvTime = time.Now()
 }
 
 //
@@ -262,10 +272,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = false
 		return
 	}
-	
+
+	rf.keepBedingFollower()
 	if args.Term > rf.currentTerm {
 		rf.becomeFollower(args.Term)
-	} 
+	}
 
 	if rf.votedFor == -1 {
 		rf.votedFor = args.CandidateID
@@ -310,13 +321,49 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 }
 
 type AppendEntriesArgs struct {
+	Term     int
+	LeaderID int
 }
 
 type AppendEntriesReply struct {
+	Term    int
+	Success bool
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
+	reply.Term = rf.currentTerm
+	if args.Term < rf.currentTerm {
+		reply.Success = false
+		return
+	}
+
+	reply.Success = true
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.becomeFollower(args.Term)
+	}
+
+	rf.lastHBrecvTime = time.Now()
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
+func (rf *Raft) processAppendEntries(server int, term int) {
+	req := AppendEntriesArgs{Term: term, LeaderID: rf.me}
+	var reply AppendEntriesReply
+	log.Printf("[%d] send AppendEntries %+v\n", rf.me, req)
+	ok := rf.sendAppendEntries(server, &req, &reply)
+	if !ok {
+		log.Printf("[%d] sendAppendEntries failed\n", rf.me)
+		return
+	}
+	log.Printf("[%d] recv AppendEntriesReply %+v\n", rf.me, reply)
 }
 
 //
@@ -374,20 +421,76 @@ func (rf *Raft) processVote(args RequestVoteArgs) {
 
 }
 
-func (rf *Raft) followerRoutine() {
-	if rf.state != follower {
-		panic("")
-	}
+func (rf *Raft) followerLoop() {
+	for {
+		time.Sleep(10 * time.Millisecond)
+		if rf.killed() {
+			return
+		}
+		func() {
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
 
-	select {
-	case <-rf.timer.C:
-		rf.processTimeout()
-	case vote := <-rf.voteCh:
-		rf.processVote(vote)
-	case entry := rf.appendCh:
-		rf.processEntry(entry)
+			if rf.state != follower {
+				return
+			}
+			if time.Now().Sub(rf.lastHBrecvTime) < electionTimeout() {
+				return
+			}
+			rf.becomeCandidate()
+		}()
 	}
+}
 
+func (rf *Raft) candidateLoop() {
+	for {
+		time.Sleep(10 * time.Millisecond)
+		if rf.killed() {
+			return
+		}
+		func() {
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+
+			if rf.state != candidate {
+				return
+			}
+			if time.Now().Sub(rf.timeBeCandidate) < electionTimeout() {
+				return
+			}
+			if rf.votes < len(rf.peers)/2+1 {
+				rf.startElection()
+			}
+		}()
+	}
+}
+
+func (rf *Raft) leaderLoop() {
+	for {
+		time.Sleep(10 * time.Millisecond)
+		if rf.killed() {
+			return
+		}
+		func() {
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+
+			if rf.state != leader {
+				return
+			}
+			now := time.Now()
+			if now.Sub(rf.lastHBsendTime) < sendHBInterval() {
+				return
+			}
+			rf.lastHBsendTime = now
+			for i := 0; i < len(rf.peers); i++ {
+				if i == rf.me {
+					continue
+				}
+				go rf.processAppendEntries(i, rf.currentTerm)
+			}
+		}()
+	}
 }
 
 //
@@ -408,9 +511,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 
+	rf.lastHBrecvTime = time.Now()
+	rf.lastHBsendTime = time.Now()
+	rf.timeBeCandidate = time.Now()
 	// Your initialization code here (2A, 2B, 2C).
 	rf.becomeFollower(0)
-	go rf.followerRoutine()
+	go rf.followerLoop()
+	go rf.candidateLoop()
+	go rf.leaderLoop()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
