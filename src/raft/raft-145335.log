@@ -1,0 +1,10 @@
+2020/04/04 14:53:35.494818 raft.go:212: [0]  -> follower
+2020/04/04 14:53:35.494958 raft.go:212: [1]  -> follower
+2020/04/04 14:53:35.495054 raft.go:212: [2]  -> follower
+2020/04/04 14:53:35.495115 raft.go:212: [3]  -> follower
+2020/04/04 14:53:35.495178 raft.go:212: [4]  -> follower
+2020/04/04 14:53:35.495278 raft.go:756: [4] start follower loop
+2020/04/04 14:53:35.495355 raft.go:756: [0] start follower loop
+2020/04/04 14:53:35.495404 raft.go:756: [1] start follower loop
+2020/04/04 14:53:35.495426 raft.go:756: [2] start follower loop
+2020/04/04 14:53:35.495521 raft.go:756: [3] start follower loop
