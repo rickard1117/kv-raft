@@ -58,15 +58,13 @@ const (
 )
 
 func init() {
-	rand.Seed(time.Now().UnixNano())
-	file := "./raft-" + strconv.Itoa(time.Now().Hour()) + strconv.Itoa(time.Now().Minute()) + strconv.Itoa(time.Now().Second()) + ".log"
-
+	// rand.Seed(time.Now().UnixNano())
+	file := "./raft-" + strconv.FormatInt(time.Now().Unix(), 10) + ".log"
 	logFile, err := os.OpenFile(file, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0766)
 	if err != nil {
 		panic(err)
 	}
-	log.SetOutput(logFile) // 将文件设置为log输出的文件
-	// log.SetPrefix("[raft]")
+	log.SetOutput(logFile)
 	log.SetFlags(log.LstdFlags | log.Lshortfile | log.Lmicroseconds)
 	return
 }
@@ -203,7 +201,7 @@ func electionTimeout() time.Duration {
 }
 
 func sendHBInterval() time.Duration {
-	return time.Duration(200) * time.Millisecond
+	return time.Duration(100) * time.Millisecond
 }
 
 // becomeFollower must be called after rf.mu.Lock()
@@ -373,6 +371,8 @@ func (rf *Raft) leaderLoopForPeers(peer int, term int) {
 		if rf.killed() || rf.state != leader {
 			return
 		}
+
+		// if time.Now().Sub(rf.lastSendAppendEntriesTime[peer]) < sendRPCInteral()
 
 		if time.Now().Sub(rf.lastSendAppendEntriesTime[peer]) < sendHBInterval() {
 			continue
