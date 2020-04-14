@@ -49,6 +49,7 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	PeerID       int
 }
 
 type raftState string
@@ -161,6 +162,10 @@ func (rf *Raft) GetState() (int, bool) {
 	return rf.currentTerm, rf.state == leader
 }
 
+func (rf *Raft) GetIdx() int {
+	return rf.me
+}
+
 //
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
@@ -267,7 +272,10 @@ func (rf *Raft) leaderProcessAppendEntries(server int, req *AppendEntriesArgs) {
 	var reply AppendEntriesReply
 	log.Printf("[%d] send AppendEntries to %d : %+v\n", rf.me, server, *req)
 
+	rf.mu.Lock()
 	rf.lastSendAppendEntriesTime[server] = time.Now()
+	rf.mu.Unlock()
+
 	ok := rf.peers[server].Call("Raft.AppendEntries", req, &reply)
 	if !ok {
 		log.Printf("[%d] AppendEntries failed\n", rf.me)
@@ -352,7 +360,6 @@ func (rf *Raft) checkCommit() {
 				}
 			}
 		}
-
 	}
 
 	if rf.commitIndex > beforeCommitIdx {
@@ -364,6 +371,7 @@ func (rf *Raft) checkCommit() {
 				CommandValid: true,
 				Command:      rf.indexLog(i).Command,
 				CommandIndex: i,
+				PeerID:       rf.me,
 			}
 			log.Printf("[%d] applyCh <- %+v\n", rf.me, msg)
 			rf.applyCh <- msg
@@ -409,11 +417,23 @@ func (rf *Raft) leaderLoopForPeers(peer int, term int) {
 
 		time.Sleep(10 * time.Millisecond)
 
-		if rf.killed() || rf.state != leader {
+		if rf.killed() {
 			return
 		}
 
-		if time.Now().Sub(rf.lastSendAppendEntriesTime[peer]) < sendHBInterval() {
+		rf.mu.Lock()
+		if rf.state != leader {
+			rf.mu.Unlock()
+			return
+		}
+		rf.mu.Unlock()
+
+		t := func() time.Time {
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+			return rf.lastSendAppendEntriesTime[peer]
+		}()
+		if time.Now().Sub(t) < sendHBInterval() {
 			continue
 		}
 
@@ -675,7 +695,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Success, reply.XTerm, reply.XIndex = rf.matchLog(args.PrevLogIndex, args.PrevLogTerm)
 	if !reply.Success {
 		reply.XLen = len(rf.log)
-		log.Printf("[%d] prev log [%d, %d] doesn't match any log %+v\n", rf.me, args.PrevLogIndex, args.PrevLogTerm, rf.log)
+		// log.Printf("[%d] prev log [%d, %d] doesn't match any log %+v\n", rf.me, args.PrevLogIndex, args.PrevLogTerm, rf.log)
 		return
 	}
 
@@ -684,7 +704,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if idx > rf.lastLogIndex() || rf.indexLog(idx).Term != args.Entries[i-1].Term {
 			rf.log = append(rf.log[:idx-1], args.Entries[i-1:]...)
 			rf.persist()
-			log.Printf("[%d] log append %+v , now is %+v\n", rf.me, args.Entries[i-1:], rf.log)
+			// log.Printf("[%d] log append %+v , now is %+v\n", rf.me, args.Entries[i-1:], rf.log)
 			break
 		}
 	}
@@ -699,6 +719,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				CommandValid: true,
 				Command:      logentry.Command,
 				CommandIndex: index,
+				PeerID:       rf.me,
 			}
 			log.Printf("[%d] applyCh <- %+v\n", rf.me, msg)
 			rf.applyCh <- msg
