@@ -96,6 +96,8 @@ type Raft struct {
 	// 2B
 	log         []logEntry
 	commitIndex int
+	// 3B
+	lastApplied int
 	// only for leader, reinitialized after election:
 	nextIndex  []int
 	matchIndex []int // for checking if one entry can commit
@@ -166,6 +168,30 @@ func (rf *Raft) GetIdx() int {
 	return rf.me
 }
 
+// log after idx will be saved
+func (rf *Raft) SaveSnapshot(snapshot []byte, idx int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if idx > rf.lastApplied {
+		log.Fatalf("[%d] idx %d > rf.lastApplied %d", rf.me, idx, rf.lastApplied)
+	}
+	log.Printf("[%d] going to save snapshot before idx %d\n", rf.me, idx)
+
+	rf.log = rf.logAfterIdx(idx)
+	rf.lastApplied = idx
+	rf.persister.SaveStateAndSnapshot(rf.logstate(), snapshot)
+}
+
+func (rf *Raft) logstate() []byte {
+	buf := new(bytes.Buffer)
+	e := labgob.NewEncoder(buf)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	return buf.Bytes()
+}
+
 //
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
@@ -173,13 +199,7 @@ func (rf *Raft) GetIdx() int {
 //
 func (rf *Raft) persist() {
 	// Your code here (2C).
-	buf := new(bytes.Buffer)
-	e := labgob.NewEncoder(buf)
-	e.Encode(rf.currentTerm)
-	e.Encode(rf.votedFor)
-	e.Encode(rf.log)
-	data := buf.Bytes()
-	rf.persister.SaveRaftState(data)
+	rf.persister.SaveRaftState(rf.logstate())
 }
 
 //
@@ -204,7 +224,6 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.votedFor = votedfor
 		rf.log = log
 	}
-
 }
 
 // election timeouts in the range of 450 to 900 milliseconds
@@ -265,7 +284,19 @@ func (rf *Raft) becomeLeader() {
 }
 
 func (rf *Raft) lastLogIndex() int {
-	return len(rf.log)
+	return len(rf.log) + rf.lastApplied
+}
+
+func (rf *Raft) indexLog(index int) logEntry {
+	return rf.log[index - rf.lastApplied -1]
+}
+
+func (rf *Raft) logAfterIdx(idx int) []logEntry {
+	return rf.log[idx - rf.lastApplied:]
+}
+
+func (rf *Raft) logBeforeIdx(idx int) []logEntry {
+	return rf.log[:idx-1]
 }
 
 func (rf *Raft) leaderProcessAppendEntries(server int, req *AppendEntriesArgs) {
@@ -338,15 +369,13 @@ func (rf *Raft) leaderProcessAppendEntries(server int, req *AppendEntriesArgs) {
 	log.Printf("[%d] server[%d] nextIndex = %d\n", rf.me, server, rf.nextIndex[server])
 }
 
-func (rf *Raft) indexLog(index int) logEntry {
-	return rf.log[index-1]
-}
+
 
 // Lock first
 func (rf *Raft) checkCommit() {
 	log.Printf("[%d] before checkcommit : %d\n", rf.me, rf.commitIndex)
 	beforeCommitIdx := rf.commitIndex
-	for index := rf.commitIndex + 1; index <= len(rf.log); index++ {
+	for index := rf.commitIndex + 1; index <= rf.lastLogIndex(); index++ {
 		majority := 0
 		for server := 0; server < len(rf.peers); server++ {
 			if server == rf.me {
@@ -398,7 +427,7 @@ func (rf *Raft) entreisToSend(peer int) (entries []logEntry, prevLogIndex int, p
 	}
 
 	prevLogIndex = rf.nextIndex[peer] - 1
-	entries = rf.log[prevLogIndex:]
+	entries = rf.logAfterIdx(prevLogIndex)
 	if prevLogIndex == 0 {
 		prevLogTerm = 0
 	} else {
@@ -426,10 +455,10 @@ func (rf *Raft) leaderLoopForPeers(peer int, term int) {
 			rf.mu.Unlock()
 			return
 		}
-		rf.mu.Unlock()
+		// rf.mu.Unlock()
 
 		t := func() time.Time {
-			rf.mu.Lock()
+			// rf.mu.Lock()
 			defer rf.mu.Unlock()
 			return rf.lastSendAppendEntriesTime[peer]
 		}()
@@ -582,7 +611,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 }
 
 func (rf *Raft) logMoreUpTodate(index int, term int) bool {
-	if len(rf.log) == 0 {
+	if rf.lastLogIndex() == 0 {
 		return false
 	}
 	lastLog := rf.indexLog(rf.lastLogIndex())
@@ -694,7 +723,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	reply.Success, reply.XTerm, reply.XIndex = rf.matchLog(args.PrevLogIndex, args.PrevLogTerm)
 	if !reply.Success {
-		reply.XLen = len(rf.log)
+		reply.XLen = rf.lastLogIndex()
 		// log.Printf("[%d] prev log [%d, %d] doesn't match any log %+v\n", rf.me, args.PrevLogIndex, args.PrevLogTerm, rf.log)
 		return
 	}
@@ -702,7 +731,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	for i := 1; i <= len(args.Entries); i++ {
 		idx := args.PrevLogIndex + i
 		if idx > rf.lastLogIndex() || rf.indexLog(idx).Term != args.Entries[i-1].Term {
-			rf.log = append(rf.log[:idx-1], args.Entries[i-1:]...)
+			rf.log = append(rf.logBeforeIdx(idx), args.Entries[i-1:]...)
 			rf.persist()
 			// log.Printf("[%d] log append %+v , now is %+v\n", rf.me, args.Entries[i-1:], rf.log)
 			break
