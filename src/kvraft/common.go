@@ -1,9 +1,10 @@
 package kvraft
 
 const (
-	OK             = "OK"
-	ErrNoKey       = "ErrNoKey"
-	ErrWrongLeader = "ErrWrongLeader"
+	OK               = "OK"
+	ErrNoKey         = "ErrNoKey"
+	ErrWrongLeader   = "ErrWrongLeader"
+	ErrServiceKilled = "ErrServiceKilled"
 )
 
 type Err string
@@ -37,7 +38,7 @@ func (args *PutAppendArgs) toOp() Op {
 }
 
 type PutAppendReply struct {
-	Err     Err
+	Err Err
 }
 
 type GetArgs struct {
@@ -57,6 +58,6 @@ func (args *GetArgs) toOp() Op {
 }
 
 type GetReply struct {
-	Err     Err
-	Value   string
+	Err   Err
+	Value string
 }

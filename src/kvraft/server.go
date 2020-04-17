@@ -119,23 +119,6 @@ func (kv *KVServer) execute(op Op) (result execResult) {
 	kv.store[op.Key] = kv.store[op.Key] + op.Value
 	log.Printf("[%d] after append, kv.store[%+v] = %+v\n", kv.me, op.Key, kv.store[op.Key])
 	return
-	// val, ok := kv.store[op.Key]
-	// if !ok {
-	// 	result.err = ErrNoKey
-	// 	return
-	// }
-
-	// result.err = OK
-	// if op.Type == OpGet {
-	// 	result.value = val
-	// 	log.Printf("[%d] after get, kv.store[%+v] = %+v\n", kv.me, op.Key, result.value)
-	// 	return
-	// }
-
-	// // Append
-	// kv.store[op.Key] = val + op.Value
-	// log.Printf("[%d] after append, kv.store[%+v] = %+v\n", kv.me, op.Key, kv.store[op.Key])
-	// return
 }
 
 func (kv *KVServer) opExecuter() {
@@ -179,23 +162,22 @@ func (kv *KVServer) getClerkMeta(id int64) *clerkMeta {
 	return kv.clients[id]
 }
 
-func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
+func (kv *KVServer) dealRPC(clerkid int64, op Op) (result execResult) {
 	_, isleader := kv.rf.GetState()
 	if !isleader {
-		reply.Err = ErrWrongLeader
+		result.err = ErrWrongLeader
 		return
 	}
-	log.Printf("[%d] Get request %+v\n", kv.me, *args)
-	clerk := kv.getClerkMeta(args.ClerkID)
+	log.Printf("[%d] request coming : %+v\n", kv.me, op)
+	clerk := kv.getClerkMeta(clerkid)
 
 	clerk.add()
 	defer clerk.reduce()
 
-	op := args.toOp()
+	// op := args.toOp()
 	_, term, isleader := kv.rf.Start(op)
 	if !isleader {
-		reply.Err = ErrWrongLeader
+		result.err = ErrWrongLeader
 		return
 	}
 
@@ -203,65 +185,42 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		select {
 		case <-time.After(100 * time.Millisecond):
 			if kv.killed() {
+				result.err = ErrServiceKilled
+				log.Printf("[%d] service killed\n", kv.me)
 				return
 			}
 			currentTerm, _ := kv.rf.GetState()
 			if currentTerm != term {
-				reply.Err = ErrWrongLeader
+				result.err = ErrWrongLeader
 				return
 			}
-		case result := <-clerk.ch:
-			if result.reqID != args.ReqID {
+		case res := <-clerk.ch:
+			if res.reqID != op.ReqID {
 				continue
 			}
-			reply.Err = result.err
-			reply.Value = result.value
-			log.Printf("[%d] Get reply for request %+v : %+v\n", kv.me, *args, *reply)
+			result.err = res.err
+			result.value = res.value
+			log.Printf("[%d] reply for request %+v : %+v\n", kv.me, op, res)
 			return
 		}
 	}
 }
 
+func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
+	result := kv.dealRPC(args.ClerkID, args.toOp())
+	if result.err == ErrServiceKilled {
+		return
+	}
+	reply.Err = result.err
+	reply.Value = result.value
+}
+
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	_, isleader := kv.rf.GetState()
-	if !isleader {
-		reply.Err = ErrWrongLeader
+	result := kv.dealRPC(args.ClerkID, args.toOp())
+	if result.err == ErrServiceKilled {
 		return
 	}
-	log.Printf("[%d] PutAppend request %+v\n", kv.me, *args)
-	clerk := kv.getClerkMeta(args.ClerkID)
-
-	clerk.add()
-	defer clerk.reduce()
-
-	op := args.toOp()
-	_, term, isleader := kv.rf.Start(op)
-	if !isleader {
-		reply.Err = ErrWrongLeader
-		return
-	}
-
-	for {
-		select {
-		case <-time.After(100 * time.Millisecond):
-			if kv.killed() {
-				return
-			}
-			currentTerm, _ := kv.rf.GetState()
-			if currentTerm != term {
-				reply.Err = ErrWrongLeader
-				return
-			}
-		case result := <-clerk.ch:
-			if result.reqID != args.ReqID {
-				continue
-			}
-			reply.Err = result.err
-			log.Printf("[%d] PutAppend reply for request %+v : %+v\n", kv.me, *args, *reply)
-			return
-		}
-	}
-
+	reply.Err = result.err
 }
 
 //
