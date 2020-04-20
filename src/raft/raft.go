@@ -186,9 +186,6 @@ func (rf *Raft) GetIdx() int {
 func (rf *Raft) SaveSnapshot(kvstore interface{}, idx int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	// if idx < rf.lastApplied {
-	// 	log.Fatalf("[%d] idx %d < rf.lastApplied %d", rf.me, idx, rf.lastApplied)
-	// }
 
 	if idx <= rf.lastApplied {
 		log.Printf("[%d] idx[%d] == rf.lastApplied[%d],  ignore\n", rf.me, idx, idx)
@@ -417,9 +414,6 @@ func (rf *Raft) leaderProcessAppendEntries(server int, req *AppendEntriesArgs) {
 		return
 	}
 
-	// if reply.XTerm == 0 {
-	// 	panic("reply.Term == 0")
-	// }
 
 	find := false
 	for i := rf.lastLogIndex(); i > rf.lastApplied; i-- {
@@ -431,10 +425,6 @@ func (rf *Raft) leaderProcessAppendEntries(server int, req *AppendEntriesArgs) {
 	}
 	if !find {
 		rf.nextIndex[server] = max(reply.XIndex, 1)
-		// if rf.nextIndex[server] == 0 {
-		// 	rf.nextIndex[server] = 1
-		// 	log.Printf("[%d] rf.nextIndex[%d] == 0\n", rf.me, server)
-		// }
 	}
 	log.Printf("[%d] server[%d] nextIndex = %d\n", rf.me, server, rf.nextIndex[server])
 }
