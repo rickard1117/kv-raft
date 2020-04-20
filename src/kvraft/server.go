@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -40,36 +41,43 @@ type Op struct {
 }
 
 type clerkMeta struct {
-	id int64 // Clerk ID
-	// WaitingIdx int
+	id        int64 // Clerk ID
 	lastReqID int64
-	// ResultID   int64
-	// ResultIdx  int
-	result  execResult
-	waiting int
-	ch      chan execResult
-	mu      sync.Mutex
-	// chs map[int64]chan execResult
+	result    ExecResult
+	waiting   int
+	ch        chan ExecResult
+	mu        sync.Mutex
 }
 
-type execResult struct {
-	reqID int64
-	err   Err
-	value string
+type ExecResult struct {
+	ReqID int64
+	Err   Err
+	Value string
 }
 
 type KVServer struct {
-	mu      sync.Mutex
-	me      int
-	rf      *raft.Raft
-	applyCh chan raft.ApplyMsg
-	dead    int32 // set by Kill()
+	mu        sync.Mutex
+	storelock sync.Mutex
+	me        int
+	rf        *raft.Raft
+	applyCh   chan raft.ApplyMsg
+	dead      int32 // set by Kill()
 
-	maxraftstate int // snapshot if log grows this big
-
+	maxraftstate  int // snapshot if log grows this big
+	lastExecIndex int
 	// Your definitions here.
 	store   map[string]string
 	clients map[int64]*clerkMeta
+}
+
+type SnapshotClient struct {
+	LastReqID int64
+	Result    ExecResult
+}
+
+type Snapshot struct {
+	Store   map[string]string
+	Clients map[int64]SnapshotClient
 }
 
 func (clerk *clerkMeta) add() {
@@ -77,7 +85,7 @@ func (clerk *clerkMeta) add() {
 	defer clerk.mu.Unlock()
 
 	if clerk.waiting == 0 {
-		clerk.ch = make(chan execResult, 1024)
+		clerk.ch = make(chan ExecResult, 1024)
 	}
 	clerk.waiting++
 }
@@ -94,57 +102,125 @@ func (clerk *clerkMeta) reduce() {
 	}
 }
 
-func (kv *KVServer) execute(op Op) (result execResult) {
+func (kv *KVServer) execute(op Op) (result ExecResult) {
 	// var result ExecResult
 
 	log.Printf("[%d] execute op : %+v\n", kv.me, op)
-	result.reqID = op.ReqID
+	result.ReqID = op.ReqID
+
 	if op.Type == OpPut {
 		kv.store[op.Key] = op.Value
-		result.err = OK
+		result.Err = OK
 		return
 	}
 
 	if op.Type == OpGet {
 		if val, ok := kv.store[op.Key]; !ok {
-			result.err = ErrNoKey
+			result.Err = ErrNoKey
 		} else {
-			result.err = OK
-			result.value = val
+			result.Err = OK
+			result.Value = val
 		}
 		return
 	}
 
-	result.err = OK
+	result.Err = OK
 	kv.store[op.Key] = kv.store[op.Key] + op.Value
 	log.Printf("[%d] after append, kv.store[%+v] = %+v\n", kv.me, op.Key, kv.store[op.Key])
 	return
 }
 
-func (kv *KVServer) opExecuter() {
+func (kv *KVServer) snapshotHandler() {
+	for {
+		time.Sleep(30 * time.Millisecond)
+		if kv.killed() {
+			log.Printf("[%d] exit snapshotHandler\n", kv.me)
+			return
+		}
+		if kv.maxraftstate == -1 {
+			continue
+		}
 
+		if kv.rf.StateSize() >= kv.maxraftstate {
+			kv.save()
+		}
+	}
+}
+
+func (kv *KVServer) save() {
+	kv.mu.Lock()
+	kv.storelock.Lock()
+	s := Snapshot{Store: kv.store, Clients: make(map[int64]SnapshotClient)}
+	for k, v := range kv.clients {
+		s.Clients[k] = SnapshotClient{LastReqID: v.lastReqID, Result: v.result}
+	}
+	idx := kv.lastExecIndex
+	buf := new(bytes.Buffer)
+	e := labgob.NewEncoder(buf)
+	e.Encode(s)
+	kv.storelock.Unlock()
+	kv.mu.Unlock()
+
+	kv.rf.SaveSnapshot(buf.Bytes(), idx)
+}
+
+func (kv *KVServer) replaySnapshot(store interface{}, lastIndex int) {
+	kv.mu.Lock()
+	kv.storelock.Lock()
+	defer kv.storelock.Unlock()
+	defer kv.mu.Unlock()
+
+	d := labgob.NewDecoder(bytes.NewBuffer(store.([]byte)))
+	var s Snapshot
+	if err := d.Decode(&s); err != nil {
+		log.Fatalf("[%d] Decode error : %+v\n", kv.me, err)
+	}
+
+	kv.store = s.Store
+	kv.lastExecIndex = lastIndex
+	kv.clients = make(map[int64]*clerkMeta)
+	for k, v := range s.Clients {
+		if kv.clients[k] == nil {
+			kv.clients[k] = &clerkMeta{id: k}
+		}
+		kv.clients[k].lastReqID = v.LastReqID
+		kv.clients[k].result = v.Result
+	}
+}
+
+func (kv *KVServer) opExecuter() {
 	for {
 		select {
 		case <-time.After(100 * time.Millisecond):
 			if kv.killed() {
+				log.Printf("[%d] exit opExecuter\n", kv.me)
 				return
 			}
 		case msg := <-kv.applyCh:
+			if !msg.CommandValid && msg.CommandType == raft.CommandSnapshot {
+
+				kv.replaySnapshot(msg.Command, msg.CommandIndex)
+				continue
+
+			}
+
 			op := msg.Command.(Op)
 			cli := kv.getClerkMeta(op.ClerkID)
+
+			kv.storelock.Lock()
+			kv.lastExecIndex = msg.CommandIndex
 			if cli.lastReqID != op.ReqID {
+				log.Printf("[%d] going to execute command %+v, last ReqID = %d\n", kv.me, msg, cli.lastReqID)
 				cli.lastReqID = op.ReqID
 				cli.result = kv.execute(op)
-				log.Printf("[%d] cli.result = %+v\n", kv.me, cli.result)
 			} else {
-				log.Printf("[%d] repeat request, not execute again%+v\n", kv.me, op)
+				log.Printf("[%d] repeated request %d\n", kv.me, op.ReqID)
 			}
+			kv.storelock.Unlock()
 
 			cli.mu.Lock()
 			if cli.waiting > 0 {
-				log.Printf("[%d] before sending result %d\n", kv.me, len(cli.ch))
 				cli.ch <- cli.result
-				log.Printf("[%d] result %+v send to client %+v\n", kv.me, cli.result, op.ClerkID)
 			}
 			cli.mu.Unlock()
 		}
@@ -162,10 +238,10 @@ func (kv *KVServer) getClerkMeta(id int64) *clerkMeta {
 	return kv.clients[id]
 }
 
-func (kv *KVServer) dealRPC(clerkid int64, op Op) (result execResult) {
+func (kv *KVServer) dealRPC(clerkid int64, op Op) (result ExecResult) {
 	_, isleader := kv.rf.GetState()
 	if !isleader {
-		result.err = ErrWrongLeader
+		result.Err = ErrWrongLeader
 		return
 	}
 	log.Printf("[%d] request coming : %+v\n", kv.me, op)
@@ -174,10 +250,9 @@ func (kv *KVServer) dealRPC(clerkid int64, op Op) (result execResult) {
 	clerk.add()
 	defer clerk.reduce()
 
-	// op := args.toOp()
 	_, term, isleader := kv.rf.Start(op)
 	if !isleader {
-		result.err = ErrWrongLeader
+		result.Err = ErrWrongLeader
 		return
 	}
 
@@ -185,21 +260,21 @@ func (kv *KVServer) dealRPC(clerkid int64, op Op) (result execResult) {
 		select {
 		case <-time.After(100 * time.Millisecond):
 			if kv.killed() {
-				result.err = ErrServiceKilled
+				result.Err = ErrServiceKilled
 				log.Printf("[%d] service killed\n", kv.me)
 				return
 			}
 			currentTerm, _ := kv.rf.GetState()
 			if currentTerm != term {
-				result.err = ErrWrongLeader
+				result.Err = ErrWrongLeader
 				return
 			}
 		case res := <-clerk.ch:
-			if res.reqID != op.ReqID {
+			if res.ReqID != op.ReqID {
 				continue
 			}
-			result.err = res.err
-			result.value = res.value
+			result.Err = res.Err
+			result.Value = res.Value
 			log.Printf("[%d] reply for request %+v : %+v\n", kv.me, op, res)
 			return
 		}
@@ -208,19 +283,19 @@ func (kv *KVServer) dealRPC(clerkid int64, op Op) (result execResult) {
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	result := kv.dealRPC(args.ClerkID, args.toOp())
-	if result.err == ErrServiceKilled {
+	if result.Err == ErrServiceKilled {
 		return
 	}
-	reply.Err = result.err
-	reply.Value = result.value
+	reply.Err = result.Err
+	reply.Value = result.Value
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	result := kv.dealRPC(args.ClerkID, args.toOp())
-	if result.err == ErrServiceKilled {
+	if result.Err == ErrServiceKilled {
 		return
 	}
-	reply.Err = result.err
+	reply.Err = result.Err
 }
 
 //
@@ -262,6 +337,7 @@ func (kv *KVServer) killed() bool {
 func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *KVServer {
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
+	log.Printf("[%d] StartKVServer!!!\n", me)
 	labgob.Register(Op{})
 
 	kv := new(KVServer)
@@ -269,12 +345,13 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.maxraftstate = maxraftstate
 
 	// You may need initialization code here.
+	kv.applyCh = make(chan raft.ApplyMsg, 100)
 
-	kv.applyCh = make(chan raft.ApplyMsg)
-	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.store = make(map[string]string)
 	kv.clients = make(map[int64]*clerkMeta)
 	go kv.opExecuter()
+	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	go kv.snapshotHandler()
 	// You may need initialization code here.
 
 	return kv
